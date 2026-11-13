@@ -1,0 +1,5 @@
+# 插件市场 Pro：读取原生 plugin-market 行的 indexes（发现页来源），
+# 在独立侧栏面板中卡片化展示、搜索/排序/推荐，并复用 pluginManager 安装、更新、卸载。
+- insert:
+    - id: plugin-market-pro
+      name: '@local/dsh-plugin-market-pro'
