@@ -174,9 +174,12 @@ node selfcheck-client.mjs   # 19 项；需要 react/react-dom/jsdom
 
 第三个 Tab「本地插件」管理自己创建的 DSH 插件：
 
+- **引导式详情**：详情弹窗用「1 版本 → 2 说明与截图 → 3 GitHub → 4 发布市场」四个步骤分页，避免长表单堆叠；每步有完成状态。
 - **发现**：自动扫描 profile 的 `link:`/`file:` 依赖 + 手动添加的目录；只接受带 `dsh.bundle` 的包。
 - **版本**：编辑 `package.json` 版本号；可同时提交并创建 `vX.Y.Z` tag，但不会自动 push。
-- **GitHub**：查看分支、远程、未提交改动、领先/落后、最后提交和仓库 API 状态（private/stars/issues）；「上传到 GitHub」可创建私有/公开仓库并 push 当前分支与 tags，不会 force-push。未初始化 git 的目录可显式勾选初始化（会生成 `.gitignore`）。
+- **GitHub**：查看分支、远程、未提交改动、领先/落后、最后提交和仓库 API 状态（private/stars/issues）；「上传到 GitHub」可创建**私有**或**公开开源**仓库并 push 当前分支与 tags，不会 force-push。公开模式会明确提示代码/README/截图/全部文件将公开。未初始化 git 的目录可显式勾选初始化（会生成 `.gitignore`）。
+- **操作反馈**：上传与发布走后台 operation（phase/log/elapsed），Client 轮询 `/publisher/operation` 显示「检查 → 初始化 → 创建仓库 → 推送 → 推送 tags」或「生成条目 → 读取索引 → 合并 → 提交」的实时进度、耗时、结果或错误；确认后不会再无反馈。
+- **AI 发布说明**：详情第 2 步「说明与截图」可调用 AI 读取 README/docs 和本地截图，生成标题、短描述、长说明与截图说明；可编辑后保存到 `docs/DETAIL.md`，再进入第 3 步 GitHub 上传，说明文档会随代码一起提交。
 - **默认 GitHub 凭据**：优先本项目保存的 Token > `GITHUB_TOKEN`/`GH_TOKEN` > **DSH `cordis.patch.yml` 里 mcp-github 的 Bearer Token** > `gh auth token`；owner 从配置/环境/DSH mcp-notes/git config 推断。Token 只显示来源，不回显。
 - **插件市场**：DSH 的“上架”是静态 `index.json`（format 1），不是中心化 API。设置里默认带出 `pluginMarket.listIndexes()` 已添加的索引；填 Index URL 即只读/手动合并，另填 GitHub `owner/repo/branch/path` 后可把插件条目直接提交进市场索引。也支持 npm 源（需先自行 `npm publish`）。
 - **配置持久化**：`~/.dsh/state/plugin-market-pro/publisher.json`，文件权限 0600；Token 不返回给 Client。

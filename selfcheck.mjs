@@ -1357,16 +1357,55 @@ async function run() {
           token: 'test-token',
         },
       })
+      const asyncStarted = await publisher2.handle('/publisher/publish', {
+        root,
+        marketId: repoMarket.market.id,
+        sourceType: 'git',
+        async: true,
+      })
+      assert.equal(asyncStarted.operation.status, 'running')
+      let asyncFinal = null
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        const polled = await publisher2.handle('/publisher/operation', { id: asyncStarted.operation.id })
+        if (polled.operation.status !== 'running') {
+          asyncFinal = polled.operation
+          break
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      assert.ok(asyncFinal, 'async publisher operation settled')
+      assert.equal(asyncFinal.status, 'done')
+      assert.equal(asyncFinal.result.mode, 'committed')
+      assert.ok(asyncFinal.log.length > 0)
+
       const committed = await publisher2.handle('/publisher/publish', {
         root,
         marketId: repoMarket.market.id,
         sourceType: 'git',
       })
       assert.equal(committed.mode, 'committed')
-      assert.equal(calls.length, 1)
+      assert.equal(calls.length, 2)
       const uploaded = JSON.parse(Buffer.from(calls[0].content, 'base64').toString('utf8'))
       assert.equal(uploaded.plugins[0].name, 'dsh-local-test')
       assert.equal(calls[0].branch, 'main')
+      await mkdir(path.join(root, 'docs'), { recursive: true })
+      await writeFile(path.join(root, 'README.md'), '# Local test\n\nLocal plugin README.\n')
+      await writeFile(path.join(root, 'docs', 'preview.png'), 'not-a-real-png')
+      const described = await publisher.handle('/publisher/describe', { root, lang: 'zh' })
+      assert.equal(described.ok, true)
+      assert.ok(Array.isArray(described.draft.screenshots))
+      assert.ok(described.draft.screenshots.some((shot) => shot.path === 'docs/preview.png'))
+      const savedNotes = await publisher.handle('/publisher/notes', {
+        root,
+        markdown: '# Local test\n\nDetailed docs.',
+        screenshots: [{ path: 'docs/preview.png', caption: 'Preview' }],
+        lang: 'zh',
+      })
+      assert.equal(savedNotes.path, 'docs/DETAIL.md')
+      const detailFile = await readFile(path.join(root, 'docs', 'DETAIL.md'), 'utf8')
+      assert.ok(detailFile.includes('Detailed docs.'))
+      assert.ok(detailFile.includes('preview.png'))
+
       const preserved = await publisher2.handle('/publisher/markets', {
         market: { id: repoMarket.market.id, name: 'Repo market renamed', indexUrl: 'https://example.com/repo-index.json' },
       })

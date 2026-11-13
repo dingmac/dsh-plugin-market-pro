@@ -2075,6 +2075,87 @@ window.__ModuleLoader__.load({
       }
     }
 
+    const PUBLISHER_PHASES = {
+      starting: ['准备', 'Starting'],
+      checking: ['检查插件', 'Checking plugin'],
+      initializing: ['初始化仓库', 'Initializing repo'],
+      preparing: ['读取配置', 'Preparing'],
+      creating: ['创建仓库', 'Creating repo'],
+      committing: ['提交', 'Committing'],
+      pushing: ['推送分支', 'Pushing branch'],
+      tags: ['推送 tags', 'Pushing tags'],
+      building: ['生成索引条目', 'Building entry'],
+      reading: ['读取市场索引', 'Reading index'],
+      merging: ['合并条目', 'Merging entry'],
+      done: ['完成', 'Done'],
+      error: ['失败', 'Failed'],
+    }
+
+    function publisherPhase(language, phase) {
+      const entry = PUBLISHER_PHASES[phase]
+      return entry === undefined ? phase : localLabel(language, entry[0], entry[1])
+    }
+
+    function publisherPhaseOrder(kind) {
+      return kind === 'publish'
+        ? ['starting', 'preparing', 'building', 'reading', 'merging', 'committing', 'done']
+        : ['starting', 'checking', 'initializing', 'preparing', 'creating', 'committing', 'pushing', 'tags', 'done']
+    }
+
+    async function waitPublisherOperation(id, onUpdate) {
+      for (let attempt = 0; attempt < 900; attempt += 1) {
+        const data = await request('/publisher/operation', { id }, typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(15_000) : undefined)
+        const operation = data.operation
+        onUpdate(operation)
+        if (operation.status === 'done') return operation
+        if (operation.status === 'error') {
+          const error = new Error(operation.error?.message || 'publisher operation failed')
+          error.code = operation.error?.code
+          throw error
+        }
+        await new Promise((resolve) => setTimeout(resolve, 650))
+      }
+      throw new Error('publisher operation timed out')
+    }
+
+    function PublisherOperationPanel(props) {
+      const operation = props.operation
+      const language = props.language
+      const [tick, setTick] = React.useState(Date.now())
+      React.useEffect(() => {
+        if (!operation || operation.status !== 'running') return undefined
+        const timer = setInterval(() => setTick(Date.now()), 500)
+        return () => clearInterval(timer)
+      }, [operation?.status])
+      if (!operation) return null
+      const phases = publisherPhaseOrder(operation.kind)
+      const current = phases.indexOf(operation.phase)
+      const progress = operation.status === 'done' ? 100
+        : operation.status === 'error' ? Math.max(10, ((current + 1) / phases.length) * 100)
+          : Math.max(8, ((Math.max(0, current) + 1) / phases.length) * 100)
+      const elapsed = Math.max(0, Math.round(((operation.finishedAt ?? tick) - operation.startedAt) / 1000))
+      return h('div', { className: 'pmp-publisher-op pmp-publisher-op-' + operation.status },
+        h('div', { className: 'pmp-publisher-op-head' },
+          operation.status === 'running' ? h('span', { className: 'pmp-spinner pmp-spinner-sm' }) : null,
+          h('strong', null, operation.status === 'done'
+            ? localLabel(language, '操作完成', 'Completed')
+            : operation.status === 'error'
+              ? localLabel(language, '操作失败', 'Failed')
+              : publisherPhase(language, operation.phase)),
+          h('span', { className: 'pmp-muted' }, `${elapsed}s`)),
+        h('div', { className: 'pmp-publisher-bar' }, h('span', { style: { width: `${Math.min(100, progress)}%` } })),
+        operation.status === 'running' ? h('p', { className: 'pmp-muted pmp-publisher-current' }, `${localLabel(language, '当前', 'Now')}: ${publisherPhase(language, operation.phase)}`) : null,
+        operation.error ? h('p', { className: 'pmp-warn' }, `${operation.error.code ? `[${operation.error.code}] ` : ''}${operation.error.message}`) : null,
+        operation.log?.length ? h('ul', { className: 'pmp-publisher-log' }, operation.log.slice(-5).map((entry, index) => h('li', { key: `${entry.at}-${index}` }, entry.message))) : null,
+        h('div', { className: 'pmp-publisher-phases' }, phases.filter((phase) => phase !== 'done').map((phase) => h('span', {
+          key: phase,
+          className: 'pmp-publisher-phase'
+            + (phases.indexOf(phase) <= Math.max(0, current) ? ' pmp-publisher-phase-done' : '')
+            + (phase === operation.phase ? ' pmp-publisher-phase-active' : ''),
+        }, publisherPhase(language, phase)))),
+      )
+    }
+
     function gitBadge(text, tone) {
       return h(Badge, { tone: tone ?? 'muted' }, text)
     }
@@ -2221,6 +2302,7 @@ window.__ModuleLoader__.load({
           onSettings: () => setSettings({}),
           onUpload: () => setUpload(selected),
           onPublish: (marketId) => setPublish({ plugin: selected, marketId: marketId ?? null }),
+          onPublishDraft: (draft) => setPublish({ plugin: selected, marketId: null, draft }),
           onToast,
         }) : null,
         settings ? h(PublisherSettingsModal, {
@@ -2228,7 +2310,7 @@ window.__ModuleLoader__.load({
           t,
           language,
           onClose: () => setSettings(null),
-          onSaved: async () => { await load() },
+          onSaved: async () => { await load(selected?.root) },
           onToast,
         }) : null,
         upload ? h(LocalUploadModal, {
@@ -2243,6 +2325,8 @@ window.__ModuleLoader__.load({
         publish ? h(LocalPublishModal, {
           plugin: publish.plugin,
           initialMarketId: publish.marketId,
+          initialTitle: publish.draft?.title,
+          initialDescription: publish.draft?.description,
           overview,
           t,
           language,
@@ -2263,6 +2347,10 @@ window.__ModuleLoader__.load({
       const [message, setMessage] = React.useState('')
       const [busy, setBusy] = React.useState(false)
       const [status, setStatus] = React.useState({ status: 'idle', data: null, error: null })
+      const [detailTab, setDetailTab] = React.useState('version')
+      const [draft, setDraft] = React.useState({ title: plugin.title || '', description: plugin.description || '', detail: '', screenshots: [] })
+      const [notesState, setNotesState] = React.useState({ status: 'idle', error: null, ai: false, note: null })
+      const [notesBusy, setNotesBusy] = React.useState(false)
       useEscape(true, props.onClose)
 
       React.useEffect(() => {
@@ -2270,6 +2358,9 @@ window.__ModuleLoader__.load({
         setTag(true)
         setMessage('')
         setStatus({ status: 'idle', data: null, error: null })
+        setDetailTab('version')
+        setDraft({ title: plugin.title || '', description: plugin.description || '', detail: '', screenshots: [] })
+        setNotesState({ status: 'idle', error: null, ai: false, note: null })
       }, [plugin.root, plugin.version])
 
       React.useEffect(() => {
@@ -2307,6 +2398,40 @@ window.__ModuleLoader__.load({
         }
       }
 
+      const generateNotes = async () => {
+        setNotesBusy(true)
+        setNotesState({ status: 'loading', error: null, ai: false, note: null })
+        try {
+          const data = await request('/publisher/describe', { root: plugin.root, lang: language }, typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(45_000) : undefined)
+          setDraft({
+            title: data.draft?.title || plugin.title || '',
+            description: data.draft?.description || '',
+            detail: data.draft?.detail || '',
+            screenshots: Array.isArray(data.draft?.screenshots) ? data.draft.screenshots : (data.screenshots ?? []),
+          })
+          setNotesState({ status: 'ready', error: null, ai: data.ai === true, note: data.draft?.aiNote || null, model: data.draft?.model || null })
+        } catch (error) {
+          setNotesState({ status: 'error', error: error.message, ai: false, note: null })
+        } finally {
+          setNotesBusy(false)
+        }
+      }
+
+      const saveNotes = async (goNext = false) => {
+        if (draft.detail.trim() === '') return
+        setNotesBusy(true)
+        try {
+          await request('/publisher/notes', { root: plugin.root, markdown: draft.detail, screenshots: draft.screenshots, lang: language }, typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(30_000) : undefined)
+          props.onToast(localLabel(language, '发布说明已保存到 docs/DETAIL.md', 'Publish notes saved to docs/DETAIL.md'), 'success')
+          await props.onRefresh(plugin.root)
+          if (goNext) setDetailTab('github')
+        } catch (error) {
+          props.onToast(error.message, 'error')
+        } finally {
+          setNotesBusy(false)
+        }
+      }
+
       const git = plugin.git ?? {}
       const repo = git.remoteGithub?.url || plugin.repository || ''
       const api = status.data?.api
@@ -2338,6 +2463,18 @@ window.__ModuleLoader__.load({
             h('p', { className: 'pmp-detail-desc' }, plugin.description || localLabel(language, '暂无描述', 'No description')),
             git.repoRoot && git.repoRoot !== plugin.root ? h('p', { className: 'pmp-warn pmp-local-hint' }, localLabel(language, '插件位于 monorepo 子目录；为避免提交/推送整个外层仓库，GitHub 上传会被拒绝，请在独立仓库中操作。', 'Plugin is a monorepo subdirectory; GitHub upload is refused to avoid committing/pushing the outer repository. Use a standalone repository.')) : null,
             h('div', { className: 'pmp-field-row' }, h('span', null, localLabel(language, '目录', 'Directory')), h('code', { className: 'pmp-code pmp-local-path' }, plugin.root)),
+            h('div', { className: 'pmp-local-nav' }, [
+              ['version', localLabel(language, '1 版本', '1 Version'), Boolean(git.branch)],
+              ['notes', localLabel(language, '2 说明与截图', '2 Docs'), Boolean(plugin.docs?.detail) || draft.detail !== ''],
+              ['github', localLabel(language, '3 GitHub', '3 GitHub'), Boolean(repo)],
+              ['publish', localLabel(language, '4 发布市场', '4 Market'), (overview?.markets ?? []).length > 0],
+            ].map(([id, label, done]) => h('button', {
+              key: id,
+              type: 'button',
+              className: 'pmp-local-nav-item' + (detailTab === id ? ' pmp-local-nav-active' : '') + (done ? ' pmp-local-nav-done' : ''),
+              onClick: () => setDetailTab(id),
+            }, label))),
+            h('div', { className: 'pmp-local-panel', hidden: detailTab !== 'version' },
             h('div', { className: 'pmp-section-head' },
               h('h3', { className: 'pmp-section-title' }, localLabel(language, '版本维护', 'Version')),
               tags.length > 0 ? h('div', { className: 'pmp-badges' }, tags.map((name) => h(Badge, { key: name, tone: 'muted' }, name))) : null),
@@ -2356,10 +2493,17 @@ window.__ModuleLoader__.load({
             h('p', { className: 'pmp-muted pmp-local-hint' }, localLabel(language,
               '保存只改 package.json；勾选后会在当前分支提交并打 tag，但不会自动 push。',
               'Saving only updates package.json; the checkbox commits and tags locally, but never pushes.')),
+            ),
 
+            h('div', { className: 'pmp-local-panel', hidden: detailTab !== 'github' },
             h('div', { className: 'pmp-section-head' },
               h('h3', { className: 'pmp-section-title' }, 'GitHub'),
               repo ? h('a', { className: 'pmp-link', href: repo, target: '_blank', rel: 'noreferrer' }, localLabel(language, '打开 GitHub', 'Open GitHub')) : null),
+            h('div', { className: 'pmp-local-actions' },
+              plugin.docs?.detail
+                ? h(Badge, { tone: 'done' }, localLabel(language, '发布说明已保存', 'Publish docs saved'))
+                : h(Badge, { tone: 'warn' }, localLabel(language, '建议先完成说明步骤', 'Docs step recommended')),
+              !plugin.docs?.detail ? h('button', { type: 'button', className: 'pmp-btn pmp-btn-ghost pmp-btn-sm', onClick: () => setDetailTab('notes') }, localLabel(language, '去补充说明', 'Add docs')) : null),
             h('div', { className: 'pmp-facts' },
               h('div', { className: 'pmp-fact' }, h('span', null, localLabel(language, '远程仓库', 'Remote')), h('strong', { className: 'pmp-local-fact-value' }, git.remote || localLabel(language, '未配置', 'none'))),
               h('div', { className: 'pmp-fact' }, h('span', null, localLabel(language, '分支', 'Branch')), h('strong', null, git.branch || '—')),
@@ -2375,7 +2519,9 @@ window.__ModuleLoader__.load({
             h('div', { className: 'pmp-local-actions' },
               h('button', { type: 'button', className: 'pmp-btn pmp-btn-primary pmp-btn-sm', onClick: props.onUpload }, localLabel(language, repo ? '推送到 GitHub' : '上传到 GitHub', repo ? 'Push to GitHub' : 'Upload to GitHub')),
               h('button', { type: 'button', className: 'pmp-btn pmp-btn-ghost pmp-btn-sm', onClick: props.onSettings }, localLabel(language, 'GitHub / 市场配置', 'GitHub / market settings'))),
+            ),
 
+            h('div', { className: 'pmp-local-panel', hidden: detailTab !== 'publish' },
             h('div', { className: 'pmp-section-head' },
               h('h3', { className: 'pmp-section-title' }, localLabel(language, '发布到插件市场', 'Publish to markets')),
               h('button', { type: 'button', className: 'pmp-btn pmp-btn-ghost pmp-btn-sm', onClick: () => props.onPublish() }, localLabel(language, '生成 / 发布', 'Build / publish'))),
@@ -2395,6 +2541,35 @@ window.__ModuleLoader__.load({
                   h('h4', { className: 'pmp-local-subhead' }, localLabel(language, 'DSH 已添加的索引', 'DSH index sources')),
                   h('div', { className: 'pmp-local-source-list' }, dshSourceNodes))
               : null,
+            ),
+
+            h('div', { className: 'pmp-local-panel', hidden: detailTab !== 'notes' },
+              h('div', { className: 'pmp-section-head' },
+                h('h3', { className: 'pmp-section-title' }, localLabel(language, '发布说明与截图', 'Publish docs & screenshots')),
+                h('button', { type: 'button', className: 'pmp-btn pmp-btn-primary pmp-btn-sm', disabled: notesBusy, onClick: () => void generateNotes() }, notesBusy ? localLabel(language, '生成中…', 'Generating…') : localLabel(language, 'AI 补充说明', 'AI draft'))),
+              h('p', { className: 'pmp-muted pmp-local-hint' }, localLabel(language,
+                'AI 会读取 README/docs 和本地截图，生成适合发布的长说明；可编辑后保存到 docs/DETAIL.md。截图会以相对路径写入说明。',
+                'AI reads README/docs and local screenshots, drafts publish-ready docs; edit and save to docs/DETAIL.md. Screenshots are embedded with relative paths.')),
+              notesState.status === 'error' ? h('p', { className: 'pmp-warn' }, notesState.error) : null,
+              notesState.status === 'ready' ? h('div', { className: 'pmp-badges' },
+                h(Badge, { tone: notesState.ai ? 'brand' : 'muted' }, notesState.ai ? 'AI' : localLabel(language, '本地草稿', 'Local draft')),
+                notesState.note ? h(Badge, { tone: 'muted' }, notesState.note) : null,
+                notesState.model ? h(Badge, { tone: 'muted' }, notesState.model) : null) : null,
+              h('div', { className: 'pmp-local-form-row' },
+                h('label', { className: 'pmp-field pmp-field-grow' }, h('span', null, localLabel(language, '发布标题', 'Title')), h('input', { className: 'pmp-input', value: draft.title, onChange: (e) => setDraft({ ...draft, title: e.target.value }) })),
+                h('label', { className: 'pmp-field pmp-field-grow' }, h('span', null, localLabel(language, '一句话描述', 'Short description')), h('input', { className: 'pmp-input', value: draft.description, onChange: (e) => setDraft({ ...draft, description: e.target.value }) }))),
+              h('label', { className: 'pmp-field' }, h('span', null, localLabel(language, '详细说明（Markdown）', 'Detailed docs (Markdown)')), h('textarea', { className: 'pmp-input pmp-textarea', rows: 12, value: draft.detail, onChange: (e) => setDraft({ ...draft, detail: e.target.value }), placeholder: localLabel(language, '点击「AI 补充说明」生成，或直接填写…', 'Click AI draft or write here…') })),
+              draft.screenshots?.length ? h('div', null,
+                h('h4', { className: 'pmp-local-subhead' }, `${localLabel(language, '截图', 'Screenshots')} (${draft.screenshots.length})`),
+                h('div', { className: 'pmp-badges' }, draft.screenshots.map((shot) => h(Badge, { key: shot.path, tone: 'muted' }, `${shot.path} · ${shot.caption || ''}`)))) : null,
+              h('div', { className: 'pmp-local-actions' },
+                h('button', { type: 'button', className: 'pmp-btn pmp-btn-primary pmp-btn-sm', disabled: notesBusy || draft.detail.trim() === '', onClick: () => void saveNotes(true) }, localLabel(language, '保存并前往 GitHub', 'Save and go to GitHub')),
+                h('button', { type: 'button', className: 'pmp-btn pmp-btn-ghost pmp-btn-sm', disabled: notesBusy || draft.detail.trim() === '', onClick: () => void saveNotes(false) }, localLabel(language, '仅保存', 'Save only')),
+                h('button', { type: 'button', className: 'pmp-btn pmp-btn-ghost pmp-btn-sm', disabled: notesBusy || draft.detail.trim() === '', onClick: () => props.onPublishDraft(draft) }, localLabel(language, '直接用作发布文案', 'Use as publish copy'))),
+              h('p', { className: 'pmp-muted pmp-local-hint' }, localLabel(language,
+                '先保存说明，再到 GitHub 上传；上传时勾选「先提交当前改动」，docs/DETAIL.md 会随代码一起推送。',
+                'Save docs before uploading; keep “commit current changes” checked so docs/DETAIL.md ships with the code.'))
+            ),
           ),
           h('div', { className: 'pmp-modal-foot' },
             h('span', { className: 'pmp-muted' }, localLabel(language, '本地操作不会 force-push，也不会自动执行 npm publish。', 'Local actions never force-push and never run npm publish automatically.')),
@@ -2410,30 +2585,34 @@ window.__ModuleLoader__.load({
       const hasRemote = Boolean(plugin.git?.remote)
       const [owner, setOwner] = React.useState(overview?.github?.owner || plugin.git?.remoteGithub?.owner || '')
       const [repoName, setRepoName] = React.useState(plugin.git?.remoteGithub?.name || plugin.name.split('/').pop() || '')
-      const [privateRepo, setPrivateRepo] = React.useState(true)
+      const [visibility, setVisibility] = React.useState('private')
       const [initialize, setInitialize] = React.useState(!plugin.git?.isRepo)
-      const [commit, setCommit] = React.useState(false)
+      const [commit, setCommit] = React.useState(Boolean(plugin.git?.dirty))
       const [commitMessage, setCommitMessage] = React.useState('')
       const [pushTags, setPushTags] = React.useState(true)
       const [busy, setBusy] = React.useState(false)
       const [result, setResult] = React.useState(null)
+      const [operation, setOperation] = React.useState(null)
       const [error, setError] = React.useState('')
       useEscape(true, props.onClose)
       const submit = async () => {
-        setBusy(true); setError('')
+        setBusy(true); setError(''); setResult(null); setOperation(null)
         try {
-          const data = await request('/publisher/github/push', {
+          const started = await request('/publisher/github/push', {
             root: plugin.root,
             createRepo: !hasRemote,
             owner: owner || undefined,
             repoName: repoName || undefined,
-            private: privateRepo,
+            private: visibility !== 'public',
             initialize,
             commit,
             commitMessage: commitMessage || undefined,
             pushTags,
+            async: true,
           })
-          setResult(data)
+          setOperation(started.operation)
+          const final = await waitPublisherOperation(started.operation.id, setOperation)
+          setResult(final.result)
           props.onToast(localLabel(language, '已推送到 GitHub', 'Pushed to GitHub'), 'success')
           await props.onDone()
         } catch (err) {
@@ -2443,22 +2622,32 @@ window.__ModuleLoader__.load({
         }
       }
       return h(Backdrop, { onClose: props.onClose },
-        h('div', { className: 'pmp-modal pmp-modal-sm', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'GitHub' },
+        h('div', { className: 'pmp-modal pmp-modal-md', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'GitHub' },
           h('div', { className: 'pmp-modal-head' }, h('h2', null, localLabel(language, '上传到 GitHub', 'Upload to GitHub')), h('button', { type: 'button', className: 'pmp-close', onClick: props.onClose }, '×')),
-          h('div', { className: 'pmp-modal-body' },
+          h('div', { className: 'pmp-modal-body pmp-local-upload' },
             h('p', { className: 'pmp-muted' }, localLabel(language, '会把当前分支 push 到 origin，不会 force-push。未提交的改动不会上传。', 'Pushes the current branch to origin; no force-push. Uncommitted changes are not uploaded.')),
             !overview?.github?.hasToken ? h('p', { className: 'pmp-warn' }, localLabel(language, '还没有 GitHub Token。若系统 git 已有凭据仍可尝试；否则请先在发布设置中补充。', 'No GitHub token configured. If system git already has credentials this may still work; otherwise add one in settings.')) : null,
             plugin.git?.repoRoot && plugin.git.repoRoot !== plugin.root ? h('p', { className: 'pmp-warn' }, localLabel(language, '该插件位于 monorepo 子目录，上传会被拒绝；请使用独立仓库。', 'This plugin is a monorepo subdirectory; upload is refused. Use a standalone repository.')) : null,
+            h('h4', { className: 'pmp-local-section-title' }, localLabel(language, '目标仓库', 'Target repository')),
             !plugin.git?.isRepo ? h('label', { className: 'pmp-field pmp-check' }, h('input', { type: 'checkbox', checked: initialize, onChange: (e) => setInitialize(e.target.checked) }), h('span', null, localLabel(language, '初始化 git 仓库并提交（会生成 .gitignore，仍会提交当前目录其余文件）', 'Initialize a git repository and commit (creates .gitignore; other files in this directory are committed)'))) : null,
             hasRemote ? h('div', { className: 'pmp-field-row' }, h('span', null, localLabel(language, '远程仓库', 'Remote')), h('code', { className: 'pmp-code' }, plugin.git.remote)) : h(React.Fragment, null,
               h('label', { className: 'pmp-field' }, h('span', null, localLabel(language, 'GitHub 用户/组织', 'GitHub owner')), h('input', { className: 'pmp-input', value: owner, onChange: (e) => setOwner(e.target.value) })),
               h('label', { className: 'pmp-field' }, h('span', null, localLabel(language, '仓库名', 'Repository')), h('input', { className: 'pmp-input', value: repoName, onChange: (e) => setRepoName(e.target.value) })),
-              h('label', { className: 'pmp-field pmp-check' }, h('input', { type: 'checkbox', checked: privateRepo, onChange: (e) => setPrivateRepo(e.target.checked) }), h('span', null, localLabel(language, '私有仓库', 'Private repository')))),
-            h('label', { className: 'pmp-field pmp-check' }, h('input', { type: 'checkbox', checked: commit, onChange: (e) => setCommit(e.target.checked) }), h('span', null, localLabel(language, '先提交当前所有改动', 'Commit all current changes first'))),
+              h('div', { className: 'pmp-visibility' },
+                h('label', { className: 'pmp-visibility-option' + (visibility === 'private' ? ' pmp-visibility-active' : '') },
+                  h('input', { type: 'radio', name: 'visibility', checked: visibility === 'private', onChange: () => setVisibility('private') }),
+                  h('span', null, h('strong', null, localLabel(language, '私有仓库', 'Private')), h('small', null, localLabel(language, '仅你可见', 'Only you')))),
+                h('label', { className: 'pmp-visibility-option' + (visibility === 'public' ? ' pmp-visibility-active' : '') },
+                  h('input', { type: 'radio', name: 'visibility', checked: visibility === 'public', onChange: () => setVisibility('public') }),
+                  h('span', null, h('strong', null, localLabel(language, '公开开源', 'Public / open source')), h('small', null, localLabel(language, '代码、README、截图全部公开', 'Code, README and screenshots become public')))))),
+            h('h4', { className: 'pmp-local-section-title' }, localLabel(language, '提交与推送', 'Commit and push')),
+            h('label', { className: 'pmp-field pmp-check' }, h('input', { type: 'checkbox', checked: commit, onChange: (e) => setCommit(e.target.checked) }), h('span', null, localLabel(language, '先提交当前所有改动（建议，包含 docs/DETAIL.md）', 'Commit all current changes first (recommended; includes docs/DETAIL.md)'))),
             commit ? h('label', { className: 'pmp-field' }, h('span', null, localLabel(language, '提交信息', 'Commit message')), h('input', { className: 'pmp-input', value: commitMessage, onChange: (e) => setCommitMessage(e.target.value), placeholder: 'chore: update plugin' })) : null,
             h('label', { className: 'pmp-field pmp-check' }, h('input', { type: 'checkbox', checked: pushTags, onChange: (e) => setPushTags(e.target.checked) }), h('span', null, localLabel(language, '同时推送 tags', 'Push tags too'))),
+            !hasRemote && visibility === 'public' ? h('p', { className: 'pmp-warn pmp-local-hint' }, localLabel(language, '公开开源会把你提交的代码、README、截图和所有文件发布到互联网；请确认没有密钥、内部路径或隐私数据。', 'Public/open-source makes your committed code, README, screenshots and every file publicly visible. Check for secrets, internal paths and private data first.')) : null,
+            h(PublisherOperationPanel, { operation, language }),
             error ? h('p', { className: 'pmp-warn' }, error) : null,
-            result ? h('p', { className: 'pmp-success' }, localLabel(language, `完成：${result.branch} @ ${String(result.commit).slice(0, 7)}`, `Done: ${result.branch} @ ${String(result.commit).slice(0, 7)}`)) : null,
+            result ? h('p', { className: 'pmp-success' }, localLabel(language, `完成：${result.branch} @ ${String(result.commit).slice(0, 7)}${result.initialized ? '（已初始化仓库）' : ''}`, `Done: ${result.branch} @ ${String(result.commit).slice(0, 7)}${result.initialized ? ' (repo initialized)' : ''}`)) : null,
             result?.htmlUrl ? h('a', { className: 'pmp-link', href: result.htmlUrl, target: '_blank', rel: 'noreferrer' }, result.htmlUrl) : null,
           ),
           h('div', { className: 'pmp-modal-foot' },
@@ -2607,9 +2796,10 @@ window.__ModuleLoader__.load({
         : markets[0]?.id ?? ''
       const [marketId, setMarketId] = React.useState(initial)
       const [sourceType, setSourceType] = React.useState('git')
-      const [title, setTitle] = React.useState(plugin.title || '')
-      const [description, setDescription] = React.useState(plugin.description || '')
+      const [title, setTitle] = React.useState(props.initialTitle || plugin.title || '')
+      const [description, setDescription] = React.useState(props.initialDescription || plugin.description || '')
       const [busy, setBusy] = React.useState(false)
+      const [operation, setOperation] = React.useState(null)
       const [result, setResult] = React.useState(null)
       const [error, setError] = React.useState('')
       useEscape(true, props.onClose)
@@ -2620,16 +2810,19 @@ window.__ModuleLoader__.load({
       }, [marketId, sourceType, title, description])
       const run = async (dryRun) => {
         if (!marketId) { setError(localLabel(language, '请先在设置中添加市场', 'Add a market in settings first')); return }
-        setBusy(true); setError('')
+        setBusy(true); setError(''); setResult(null); setOperation(null)
         try {
-          const data = await request('/publisher/publish', {
+          const started = await request('/publisher/publish', {
             root: plugin.root,
             marketId,
             sourceType,
             dryRun,
             overrides: { title: title || undefined, description: description || undefined },
+            async: true,
           })
-          setResult(data)
+          setOperation(started.operation)
+          const final = await waitPublisherOperation(started.operation.id, setOperation)
+          setResult(final.result)
           if (!dryRun) props.onToast(localLabel(language, '发布请求已完成', 'Publish request completed'), 'success')
         } catch (err) { setError(err.message) } finally { setBusy(false) }
       }
@@ -2644,16 +2837,17 @@ window.__ModuleLoader__.load({
               ? h('div', { className: 'pmp-empty' }, h('p', null, localLabel(language, '还没有可发布市场。', 'No publishable market yet.')), h('button', { type: 'button', className: 'pmp-btn pmp-btn-primary pmp-btn-sm', onClick: props.onSettings }, localLabel(language, '去配置市场', 'Configure markets')))
               : h(React.Fragment, null,
                   h('div', { className: 'pmp-local-form-row' },
-                    h('label', { className: 'pmp-field pmp-field-grow' }, h('span', null, localLabel(language, '目标市场', 'Market')), h('select', { className: 'pmp-input', value: marketId, onChange: (e) => setMarketId(e.target.value) }, markets.map((entry) => h('option', { key: entry.id, value: entry.id }, entry.name)))),
-                    h('label', { className: 'pmp-field' }, h('span', null, localLabel(language, '来源类型', 'Source type')), h('select', { className: 'pmp-input', value: sourceType, onChange: (e) => setSourceType(e.target.value) }, h('option', { value: 'git' }, 'git'), h('option', { value: 'npm' }, 'npm'))),
-                    h('label', { className: 'pmp-field pmp-field-grow' }, h('span', null, localLabel(language, '标题', 'Title')), h('input', { className: 'pmp-input', value: title, onChange: (e) => setTitle(e.target.value) })),
-                    h('label', { className: 'pmp-field pmp-field-grow' }, h('span', null, localLabel(language, '描述', 'Description')), h('input', { className: 'pmp-input', value: description, onChange: (e) => setDescription(e.target.value) }))),
+                    h('label', { className: 'pmp-field pmp-field-grow' }, h('span', null, localLabel(language, '目标市场', 'Market')), h('select', { className: 'pmp-input', value: marketId, disabled: busy, onChange: (e) => setMarketId(e.target.value) }, markets.map((entry) => h('option', { key: entry.id, value: entry.id }, entry.name)))),
+                    h('label', { className: 'pmp-field' }, h('span', null, localLabel(language, '来源类型', 'Source type')), h('select', { className: 'pmp-input', value: sourceType, disabled: busy, onChange: (e) => setSourceType(e.target.value) }, h('option', { value: 'git' }, 'git'), h('option', { value: 'npm' }, 'npm'))),
+                    h('label', { className: 'pmp-field pmp-field-grow' }, h('span', null, localLabel(language, '标题', 'Title')), h('input', { className: 'pmp-input', value: title, disabled: busy, onChange: (e) => setTitle(e.target.value) })),
+                    h('label', { className: 'pmp-field pmp-field-grow' }, h('span', null, localLabel(language, '描述', 'Description')), h('input', { className: 'pmp-input', value: description, disabled: busy, onChange: (e) => setDescription(e.target.value) }))),
                   h('div', { className: 'pmp-badges' },
                     market?.repo ? h(Badge, { tone: 'done' }, localLabel(language, '可自动提交 index.json', 'auto-commit index.json')) : h(Badge, { tone: 'muted' }, localLabel(language, '只读 / 手动合并', 'read-only / manual')),
                     sourceType === 'npm' ? h(Badge, { tone: 'warn' }, localLabel(language, '需要先 npm publish', 'run npm publish first')) : null),
                   h('div', { className: 'pmp-local-actions' },
                     h('button', { type: 'button', className: 'pmp-btn pmp-btn-ghost pmp-btn-sm', disabled: busy, onClick: () => void run(true) }, localLabel(language, '预览索引条目', 'Preview entry')),
                     h('button', { type: 'button', className: 'pmp-btn pmp-btn-primary pmp-btn-sm', disabled: busy, onClick: () => void run(false) }, busy ? '…' : localLabel(language, '发布', 'Publish'))),
+                  h(PublisherOperationPanel, { operation, language }),
                   error ? h('p', { className: 'pmp-warn' }, error) : null,
                   result ? h('div', { className: 'pmp-publish-result' },
                     h('div', { className: 'pmp-badges' }, h(Badge, { tone: result.mode === 'committed' ? 'done' : result.mode === 'dry-run' ? 'warn' : 'muted' }, result.mode === 'committed' ? localLabel(language, '已提交', 'Committed') : result.mode === 'dry-run' ? localLabel(language, '预览', 'Preview') : localLabel(language, '手动模式', 'Manual'))),
@@ -3475,6 +3669,7 @@ window.__ModuleLoader__.load({
 .pmp-modal{display:flex;flex-direction:column;width:100%;max-height:88vh;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);box-shadow:0 24px 60px rgba(0,0,0,.28)}
 .pmp-modal-sm{max-width:460px}
 .pmp-modal-lg{max-width:980px}
+.pmp-modal-md{max-width:640px}
 .pmp-modal-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px 16px;border-bottom:1px solid var(--dsw-alias-border-l1)}
 .pmp-modal-head h2{margin:0;font-size:14px;font-weight:650}
 .pmp-close{width:28px;height:28px;padding:0;border:0;border-radius:7px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:18px;line-height:1;cursor:pointer}
@@ -3612,11 +3807,10 @@ window.__ModuleLoader__.load({
 .pmp-alt-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px;font-weight:600}
 .pmp-alt-desc{margin:0;color:var(--dsw-alias-label-secondary);font-size:10.5px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .pmp-alt-meta{display:flex;flex-direction:column;gap:2px;min-width:0}
-.pmp-local-list{grid-template-columns:minmax(0,1fr)}
-.pmp-local-card{flex-direction:column}
-.pmp-local-card-actions{flex-direction:row;justify-content:flex-end}
 
 .pmp-local-page{display:flex;flex-direction:column;gap:12px}
+.pmp-local-upload{display:flex;flex-direction:column;gap:10px}
+.pmp-local-section-title{margin:4px 0 0;font-size:11px;font-weight:650;color:var(--dsw-alias-label-primary);padding-top:8px;border-top:1px solid var(--dsw-alias-border-l1)}
 .pmp-local-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:10px}
 .pmp-local-card{display:flex;align-items:stretch;gap:8px;padding:10px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);min-width:0}
 .pmp-local-card-main{display:flex;align-items:flex-start;gap:9px;min-width:0;flex:1;cursor:pointer}
@@ -3657,6 +3851,39 @@ window.__ModuleLoader__.load({
 .pmp-success{color:var(--dsw-alias-state-success-primary);font-size:11px}
 .pmp-local-fact-value{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block;max-width:100%}
 .pmp-local-error{margin:0}
+
+.pmp-publisher-op{display:flex;flex-direction:column;gap:6px;padding:9px 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:9px;background:var(--dsw-alias-bg-layer-1)}
+.pmp-publisher-op-head{display:flex;align-items:center;gap:7px}
+.pmp-publisher-op-head strong{flex:1;font-size:11.5px}
+.pmp-publisher-op-error{border-color:var(--dsw-alias-state-error-primary)}
+.pmp-publisher-op-done{border-color:var(--dsw-alias-state-success-primary)}
+.pmp-publisher-bar{height:4px;border-radius:3px;background:var(--dsw-alias-bg-layer-2);overflow:hidden}
+.pmp-publisher-bar>span{display:block;height:100%;border-radius:3px;background:var(--dsw-alias-brand-primary);transition:width .25s ease}
+.pmp-publisher-op-error .pmp-publisher-bar>span{background:var(--dsw-alias-state-error-primary)}
+.pmp-publisher-op-done .pmp-publisher-bar>span{background:var(--dsw-alias-state-success-primary)}
+.pmp-publisher-current{margin:0;font-size:10.5px}
+.pmp-publisher-log{margin:0;padding-left:15px;display:flex;flex-direction:column;gap:2px;font-size:10.5px;color:var(--dsw-alias-label-secondary);max-height:96px;overflow:auto}
+.pmp-publisher-phases{display:flex;flex-wrap:wrap;gap:4px}
+.pmp-publisher-phase{padding:1px 5px;border-radius:4px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:9.5px}
+.pmp-publisher-phase-done{color:var(--dsw-alias-label-primary)}
+.pmp-publisher-phase-active{background:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base)}
+.pmp-spinner{width:13px;height:13px;border-radius:50%;border:2px solid var(--dsw-alias-border-l2);border-top-color:var(--dsw-alias-brand-primary);animation:pmp-spin .8s linear infinite;display:inline-block}
+.pmp-spinner-sm{width:12px;height:12px}
+.pmp-visibility{display:flex;gap:7px;flex-wrap:wrap}
+.pmp-visibility-option{flex:1;min-width:150px;display:flex;align-items:flex-start;gap:6px;padding:7px 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;cursor:pointer;font-size:11px}
+.pmp-visibility-option input{margin-top:2px}
+.pmp-visibility-option span{display:flex;flex-direction:column;gap:2px;min-width:0}
+.pmp-visibility-option small{color:var(--dsw-alias-label-secondary);font-size:10px;line-height:1.35}
+.pmp-visibility-active{border-color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-2)}
+
+.pmp-local-nav{display:flex;gap:4px;flex-wrap:wrap;padding:3px;border:1px solid var(--dsw-alias-border-l1);border-radius:9px;background:var(--dsw-alias-bg-layer-1)}
+.pmp-local-nav-item{flex:1;min-width:96px;padding:6px 8px;border:0;border-radius:7px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:10.5px;cursor:pointer;text-align:center}
+.pmp-local-nav-item:hover{background:var(--dsw-alias-bg-layer-2)}
+.pmp-local-nav-active{background:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base);font-weight:600}
+.pmp-local-nav-done:not(.pmp-local-nav-active){color:var(--dsw-alias-state-success-primary)}
+.pmp-local-panel{display:flex;flex-direction:column;gap:10px;min-width:0}
+.pmp-local-panel[hidden]{display:none}
+.pmp-textarea{height:auto;min-height:180px;padding:8px;line-height:1.5;resize:vertical;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px}
 @media (max-width:900px){
 .pmp-detail-body{overflow:auto}
 .pmp-detail-layout{grid-template-columns:minmax(0,1fr);height:auto;overflow:visible}

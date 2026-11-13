@@ -347,6 +347,32 @@ globalThis.fetch = async (url, options) => {
   }
   if (pathname === '/alternatives') return response({ ok: true, items: [DELTA], basis: { category: 'ai', keywords: ['ai'] } })
   if (pathname === '/publisher/overview') return response(LOCAL_OVERVIEW)
+  if (pathname === '/publisher/describe') {
+    return response({
+      ok: true,
+      ai: true,
+      draft: {
+        title: 'Local Demo',
+        description: 'A locally created plugin with AI copy.',
+        detail: '# Local Demo\n\n## 功能\n\n- 本地插件管理\n\n## 截图\n\n![preview](../docs/preview.png)',
+        screenshots: [{ path: 'docs/preview.png', caption: 'Preview' }],
+      },
+      screenshots: [{ path: 'docs/preview.png', caption: 'Preview' }],
+    })
+  }
+  if (pathname === '/publisher/notes') return response({ ok: true, path: 'docs/DETAIL.md' })
+  if (pathname === '/publisher/github/push') {
+    return response({
+      ok: true,
+      operation: { id: 'pub-op-1', kind: 'github-push', status: 'running', phase: 'pushing', startedAt: Date.now() - 1200, finishedAt: null, log: [{ at: Date.now(), phase: 'pushing', message: '推送 main' }], result: null, error: null },
+    })
+  }
+  if (pathname === '/publisher/operation') {
+    return response({
+      ok: true,
+      operation: { id: 'pub-op-1', kind: 'github-push', status: 'done', phase: 'done', startedAt: Date.now() - 1600, finishedAt: Date.now(), log: [{ at: Date.now(), phase: 'pushing', message: '推送 main' }, { at: Date.now(), phase: 'done', message: '完成' }], result: { ok: true, initialized: false, repoUrl: 'https://github.com/dingmac/dsh-local-demo', htmlUrl: 'https://github.com/dingmac/dsh-local-demo', branch: 'main', commit: 'b'.repeat(40), tagsPushed: 1 }, error: null },
+    })
+  }
   if (pathname === '/publisher/github/status') {
     return response({ ok: true, plugin: LOCAL_OVERVIEW.plugins[0], github: LOCAL_OVERVIEW.github, api: { htmlUrl: 'https://github.com/dingmac/dsh-local-demo', private: false, defaultBranch: 'main', stars: 3, issues: 0, pushedAt: null } })
   }
@@ -710,6 +736,35 @@ await check('local plugins tab lists local plugins and opens maintenance detail'
   assert.ok(content.includes('发布到插件市场'))
   assert.ok(content.includes('dsh-local-demo'))
   const modal = container.querySelector('.pmp-modal')
+  const notesTab = [...modal.querySelectorAll('.pmp-local-nav-item')].find((tab) => (tab.textContent ?? '').includes('说明与截图'))
+  assert.ok(notesTab, 'notes step exists')
+  click(notesTab)
+  await wait(30)
+  const aiButton = [...modal.querySelectorAll('button')].find((button) => (button.textContent ?? '').includes('AI 补充说明'))
+  assert.ok(aiButton, 'AI draft button exists')
+  click(aiButton)
+  await wait(300)
+  const textarea = modal.querySelector('.pmp-textarea')
+  assert.ok(textarea, 'notes textarea exists')
+  assert.ok((textarea.value ?? '').includes('本地插件管理'), textarea.value)
+  assert.ok((modal.textContent ?? '').includes('docs/preview.png'), 'screenshot listed')
+  const githubTab = [...modal.querySelectorAll('.pmp-local-nav-item')].find((tab) => (tab.textContent ?? '').includes('GitHub'))
+  click(githubTab)
+  await wait(30)
+  const uploadButton = [...modal.querySelectorAll('button')].find((button) => (button.textContent ?? '').includes('推送到 GitHub') || (button.textContent ?? '').includes('上传到 GitHub'))
+  assert.ok(uploadButton, 'upload button exists')
+  click(uploadButton)
+  await wait(40)
+  const uploadModal = [...container.querySelectorAll('.pmp-modal')].find((element) => (element.textContent ?? '').includes('上传到 GitHub'))
+  assert.ok(uploadModal, 'upload modal opens')
+  const startButton = [...uploadModal.querySelectorAll('button')].find((button) => (button.textContent ?? '').includes('开始上传'))
+  assert.ok(startButton, 'start upload button exists')
+  click(startButton)
+  await wait(120)
+  assert.ok((uploadModal.textContent ?? '').includes('操作完成'), uploadModal.textContent?.slice(-300))
+  assert.ok((uploadModal.textContent ?? '').includes('dsh-local-demo'), 'repo result shown')
+  click(uploadModal.querySelector('.pmp-close'))
+  await wait(20)
   click(modal.querySelector('.pmp-close'))
   await wait(30)
 })

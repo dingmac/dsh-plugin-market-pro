@@ -3109,6 +3109,12 @@ export function createMarketService(options) {
         return publisher.handle(pathname, body)
       case '/publisher/publish':
         return publisher.handle(pathname, body)
+      case '/publisher/operation':
+        return publisher.handle(pathname, body)
+      case '/publisher/describe':
+        return publisher.handle(pathname, body)
+      case '/publisher/notes':
+        return publisher.handle(pathname, body)
       default:
         throw requestError('invalid-request', `未知方法 ${pathname}`)
     }
@@ -3220,6 +3226,9 @@ const ROUTE_METHODS = {
   '/publisher/github/status': true,
   '/publisher/github/push': true,
   '/publisher/publish': true,
+  '/publisher/operation': true,
+  '/publisher/describe': true,
+  '/publisher/notes': true,
 }
 
 /* -------------------------------------------------------------------------- */
